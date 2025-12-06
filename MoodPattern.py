@@ -11,15 +11,47 @@ from datetime import datetime, timedelta
 from typing import Optional, Dict, List, Union
 import logging
 from openai import OpenAI
+import hashlib
+import secrets
+import string
+
+
+# 密码相关工具函数
+def generate_salt(length=16):
+    """生成随机盐值"""
+    alphabet = string.ascii_letters + string.digits
+    return ''.join(secrets.choice(alphabet) for _ in range(length))
+
+
+def hash_password(password: str, salt: str = None) -> tuple:
+    """哈希密码，返回(哈希值, 盐值)"""
+    if salt is None:
+        salt = generate_salt()
+
+    # 使用PBKDF2算法
+    password_hash = hashlib.pbkdf2_hmac(
+        'sha256',
+        password.encode('utf-8'),
+        salt.encode('utf-8'),
+        100000  # 迭代次数
+    ).hex()
+
+    return password_hash, salt
+
+
+def verify_password(password: str, stored_hash: str, salt: str) -> bool:
+    """验证密码"""
+    new_hash, _ = hash_password(password, salt)
+    return new_hash == stored_hash
 
 # ========== AI 配置 ==========
-api_key = st.secrets["API_KEY"]
-api_base = st.secrets["API_BASE"]
-model_id = st.secrets["MODEL_ID"]
+API_KEY = "sk-zOXHCvNjmUjPCGCmD33e25D714194773A893D2166a86D755"
+API_BASE = "https://maas-api.cn-huabei-1.xf-yun.com/v1"
+MODEL_ID = "xopdeepseekocr"
 
 # 初始化客户端（全局，在侧边栏配置时重新初始化）
 
-client = OpenAI(api_key=api_key, base_url=api_base)
+client = OpenAI(api_key=API_KEY, base_url=API_BASE)
 
 def init_ai_client(api_key: str = None, api_base: str = None, model_id: str = None):
     """初始化AI客户端"""
@@ -36,7 +68,7 @@ def init_ai_client(api_key: str = None, api_base: str = None, model_id: str = No
 
 
 # ========== 通用 AI 调用封装 ==========
-def ask_ai(messages, json_type=False, model_id=st.secrets["MODEL_ID"]):
+def ask_ai(messages, json_type=False, model_id=MODEL_ID):
     """
     通用 AI 查询接口
     messages: str 或 list
@@ -500,7 +532,7 @@ def restore_from_backup(backup_path: str, conn) -> bool:
 def is_admin(username: str) -> bool:
     """检查是否为管理员（这里只是示例，实际需要更安全的认证）"""
     # 这里可以改成从配置文件或数据库读取管理员列表
-    admins = ["admin", "管理员", "system"]
+    admins = ["栗子惠"]
     return username in admins
 
 
@@ -642,12 +674,16 @@ def create_new_database(db_name: str) -> Path:
         # 初始化数据库结构
         conn.execute("PRAGMA foreign_keys=ON")
         conn.execute("""
-        CREATE TABLE IF NOT EXISTS users(
-            user_id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT UNIQUE NOT NULL,
-            created_at TEXT
-        );
-        """)
+           CREATE TABLE IF NOT EXISTS users(
+               user_id INTEGER PRIMARY KEY AUTOINCREMENT,
+               username TEXT UNIQUE NOT NULL,
+               password_hash TEXT NOT NULL,
+               salt TEXT NOT NULL,  # ← 添加这一行
+               email TEXT,
+               is_admin INTEGER DEFAULT 0,
+               created_at TEXT
+           );
+           """)
         conn.execute("""
         CREATE TABLE IF NOT EXISTS mood_records(
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -691,22 +727,34 @@ DEFAULT_DB_PATH = DATA_DIR / "mood_system.db"
 
 # ========== 数据库初始化 ==========
 def init_database(db_path: Path = DEFAULT_DB_PATH):
-    """初始化数据库"""
+    """初始化数据库 - 强制重建正确结构"""
+    # 连接数据库
     conn = sqlite3.connect(db_path)
     conn.execute("PRAGMA foreign_keys=ON")
 
-    # 创建用户表
+    # ----【关键修改】强制删除旧表，确保创建新结构 ----
+    # 1. 删除旧表（如果存在）
+    conn.execute("DROP TABLE IF EXISTS mood_records;")
+    conn.execute("DROP TABLE IF EXISTS users;")
+    conn.execute("DROP TABLE IF EXISTS backup_logs;")  # 也清理旧的备份日志表
+
+    # 2. 按当前代码的正确结构创建新表
+    # 创建用户表 (必须包含 password_hash 和 salt)
     conn.execute("""
-    CREATE TABLE IF NOT EXISTS users(
+    CREATE TABLE users(
         user_id INTEGER PRIMARY KEY AUTOINCREMENT,
         username TEXT UNIQUE NOT NULL,
+        password_hash TEXT NOT NULL,
+        salt TEXT NOT NULL,
+        email TEXT,
+        is_admin INTEGER DEFAULT 0,
         created_at TEXT
     );
     """)
 
-    # 创建情绪记录表（增强版）
+    # 创建情绪记录表
     conn.execute("""
-    CREATE TABLE IF NOT EXISTS mood_records(
+    CREATE TABLE mood_records(
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         user_id INTEGER,
         mood_score INTEGER CHECK (mood_score BETWEEN 1 AND 10),
@@ -723,14 +771,14 @@ def init_database(db_path: Path = DEFAULT_DB_PATH):
     );
     """)
 
-    # 创建索引以提高查询性能
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_user_id ON mood_records(user_id);")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_record_date ON mood_records(record_date);")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_mood_score ON mood_records(mood_score);")
+    # 创建索引
+    conn.execute("CREATE INDEX idx_user_id ON mood_records(user_id);")
+    conn.execute("CREATE INDEX idx_record_date ON mood_records(record_date);")
+    conn.execute("CREATE INDEX idx_mood_score ON mood_records(mood_score);")
 
     # 创建备份日志表
     conn.execute("""
-    CREATE TABLE IF NOT EXISTS backup_logs(
+    CREATE TABLE backup_logs(
         log_id INTEGER PRIMARY KEY AUTOINCREMENT,
         backup_name TEXT,
         backup_time TEXT,
@@ -741,8 +789,12 @@ def init_database(db_path: Path = DEFAULT_DB_PATH):
     );
     """)
 
-    return conn
+    # 提交所有更改
+    conn.commit()
+    # ---------------------------------
 
+    print("✅ 数据库已强制重建为最新结构")
+    return conn
 
 # 情绪标签映射
 MOOD_LABELS = {
@@ -759,10 +811,35 @@ MOOD_LABELS = {
 }
 
 
+def create_initial_admin(conn):
+    """创建初始管理员账户"""
+    try:
+        admin_check = conn.execute(
+            "SELECT user_id FROM users WHERE username = '栗子惠'"
+        ).fetchone()
+
+        if not admin_check:
+            # 创建管理员账户（默认密码：admin123）
+            password_hash, salt = hash_password("admin123")
+
+            conn.execute(
+                """INSERT INTO users (username, password_hash, salt, is_admin, created_at) 
+                VALUES (?, ?, ?, 1, datetime('now'))""",
+                ("栗子惠", password_hash, salt)
+            )
+            conn.commit()
+            print("初始管理员账户已创建：栗子惠/admin123")
+    except Exception as e:
+        print(f"创建初始管理员失败: {e}")
+
+
 # ========== 主应用界面 ==========
 def main():
     # 初始化数据库连接
     conn = init_database()
+
+    # 创建初始管理员账户
+    create_initial_admin(conn)
 
     # 侧边栏
     with st.sidebar:
@@ -770,76 +847,143 @@ def main():
         st.title("🧠 MoodPattern")
         st.caption("你的情绪管理伙伴")
 
-        # 数据库管理（新增功能）
+        #数据库管理
         st.divider()
-        st.subheader("🗃️ 数据库管理")
+        st.subheader("🗄️ 数据存储")
 
-        # 显示当前数据库信息
-        db_size = DEFAULT_DB_PATH.stat().st_size if DEFAULT_DB_PATH.exists() else 0
-        st.info(f"当前数据库: {DEFAULT_DB_PATH.name}")
-        st.metric("数据库大小", f"{db_size:,} bytes")
+        # 用户友好的显示方式
+        if DEFAULT_DB_PATH.exists():
+            st.success("✅ 数据存储正常")
+        else:
+            st.info("🔄 正在初始化数据存储")
 
-        # 数据库操作
-        with st.expander("数据库操作"):
-            # 创建新数据库
-            new_db_name = st.text_input("新数据库名称", placeholder="输入数据库名称")
-            if st.button("创建新数据库"):
-                if new_db_name:
-                    new_db_path = create_new_database(new_db_name)
-                    st.success(f"已创建数据库: {new_db_path.name}")
-                else:
-                    st.warning("请输入数据库名称")
+        # 显示用户记录统计（而不是数据库大小）
+        if 'current_user' in st.session_state:
+            user_id = st.session_state.user_id
+            user_df = load_user_data(conn, user_id)
+            record_count = len(user_df) if not user_df.empty else 0
 
-            # 切换数据库
-            available_dbs = get_available_databases()
-            if available_dbs:
-                db_options = [db.name for db in available_dbs]
-                selected_db = st.selectbox("选择数据库", db_options)
-                if st.button("切换数据库"):
-                    st.session_state.selected_db = DATA_DIR / selected_db
+            if record_count > 0:
+                st.metric("我的记录数", f"{record_count} 条")
+            else:
+                st.info("暂无记录，开始记录你的情绪吧！")
+
+        # 简化的数据库操作
+        with st.expander("数据管理选项"):
+            # 只保留对用户有用的选项
+            col1, col2 = st.columns(2)
+
+            with col1:
+                if st.button("🔄 刷新数据", help="刷新页面数据"):
                     st.rerun()
 
-            # 查看数据库信息
-            if st.button("查看数据库信息"):
-                manage_database_files()
+            with col2:
+                if st.button("🗑️ 清理缓存", help="清理临时数据"):
+                    st.info("数据清理功能开发中")
 
+        # 管理员专属部分
+        if 'current_user' in st.session_state and is_admin(st.session_state.current_user):
+            with st.expander("👑 管理员工具", expanded=False):
+                # 数据库大小（仅管理员可见）
+                db_size = DEFAULT_DB_PATH.stat().st_size if DEFAULT_DB_PATH.exists() else 0
+                st.write(f"**数据库信息**")
+                st.write(f"- 文件: {DEFAULT_DB_PATH.name}")
+                st.write(f"- 大小: {db_size:,} bytes")
+
+                # 创建新数据库（仅管理员）
+                new_db_name = st.text_input("新数据库名称", placeholder="test_db")
+                if st.button("创建测试数据库"):
+                    if new_db_name:
+                        new_db_path = create_new_database(new_db_name)
+                        st.success(f"已创建: {new_db_path.name}")
         # 用户管理部分
         st.divider()
         st.subheader("👤 用户管理")
-        username = st.text_input("请输入用户名")
 
-        if st.button("选择/创建用户"):
-            if username:
-                # 检查用户是否存在
-                user_check = conn.execute(
-                    "SELECT user_id FROM users WHERE username = ?",
-                    (username,)
-                ).fetchone()
+        # 如果是新用户，显示注册表单
+        if 'current_user' not in st.session_state:
+            tab_login, tab_register = st.tabs(["🔐 登录", "📝 注册"])
 
-                if not user_check:
-                    # 创建新用户
-                    conn.execute(
-                        "INSERT INTO users (username, created_at) VALUES (?, datetime('now'))",
-                        (username,)
-                    )
-                    conn.commit()
-                    st.success(f"新用户 {username} 已创建！")
-                else:
-                    st.info(f"欢迎回来，{username}！")
+            with tab_login:
+                login_username = st.text_input("用户名", key="login_username")
+                login_password = st.text_input("密码", type="password", key="login_password")
 
-                # 设置当前用户到session state
-                st.session_state.current_user = username
-                st.session_state.user_id = conn.execute(
-                    "SELECT user_id FROM users WHERE username = ?",
-                    (username,)
-                ).fetchone()[0]
-                st.rerun()
+                if st.button("登录", type="primary"):
+                    if login_username and login_password:
+                        # 验证用户
+                        user_check = conn.execute(
+                            "SELECT user_id, password_hash, salt FROM users WHERE username = ?",
+                            (login_username,)
+                        ).fetchone()
+
+                        if user_check and verify_password(login_password, user_check[1], user_check[2]):
+                            st.session_state.current_user = login_username
+                            st.session_state.user_id = user_check[0]
+                            st.success(f"欢迎回来，{login_username}！")
+                            st.rerun()
+                        else:
+                            st.error("用户名或密码错误")
+                    else:
+                        st.warning("请输入用户名和密码")
+
+            with tab_register:
+                reg_username = st.text_input("新用户名", key="reg_username")
+                reg_password = st.text_input("设置密码", type="password", key="reg_password")
+                reg_confirm = st.text_input("确认密码", type="password", key="reg_confirm")
+                reg_email = st.text_input("邮箱（可选）", key="reg_email")
+
+                if st.button("注册", type="secondary"):
+                    if not reg_username:
+                        st.error("请输入用户名")
+                    elif not reg_password:
+                        st.error("请设置密码")
+                    elif reg_password != reg_confirm:
+                        st.error("两次输入的密码不一致")
+                    elif len(reg_password) < 6:
+                        st.error("密码至少6位")
+                    else:
+                        # 检查用户名是否已存在
+                        existing_user = conn.execute(
+                            "SELECT user_id FROM users WHERE username = ?",
+                            (reg_username,)
+                        ).fetchone()
+
+                        if existing_user:
+                            st.error("用户名已存在")
+                        else:
+                            # 哈希密码
+                            password_hash, salt = hash_password(reg_password)
+
+                            # 插入新用户
+                            conn.execute(
+                                """INSERT INTO users (username, password_hash, salt, email, created_at) 
+                                VALUES (?, ?, ?, ?, datetime('now'))""",
+                                (reg_username, password_hash, salt, reg_email)
+                            )
+                            conn.commit()
+
+                            # 获取新用户ID
+                            new_user_id = conn.execute(
+                                "SELECT user_id FROM users WHERE username = ?",
+                                (reg_username,)
+                            ).fetchone()[0]
+
+                            st.session_state.current_user = reg_username
+                            st.session_state.user_id = new_user_id
+                            st.success(f"注册成功！欢迎使用MoodPattern")
+                            st.rerun()
 
         # 显示当前用户
         if 'current_user' in st.session_state:
             st.divider()
             st.subheader("当前用户")
             st.success(f"👤 {st.session_state.current_user}")
+
+            # 添加退出登录按钮
+            if st.button("退出登录"):
+                for key in list(st.session_state.keys()):
+                    del st.session_state[key]
+                st.rerun()
 
             # 检查是否为管理员
             admin_mode = False
@@ -959,14 +1103,13 @@ def main():
         st.info("👑 管理员视图：您可以查看和搜索所有用户的数据")
 
     # 标签页 - 修改这里增加Tab 7和Tab 8
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7= st.tabs([
         "📝 记录情绪",
         "📊 情绪分析",
         "🤖 AI助手",
         "📈 趋势",
         "⚙️ 设置",
         "🔧 管理",
-        "📊 分析中心",
         "🔐 安全中心"
     ])
 
@@ -1601,198 +1744,9 @@ def main():
         else:
             st.warning("🔒 仅管理员可访问此页面")
 
-    # Tab 7: 分析中心（功能7）
+
+    # Tab 7: 安全中心（功能7）
     with tab7:
-        st.subheader("📊 分析中心")
-
-        # 用户行为分析
-        st.header("👤 用户行为分析")
-
-        if df.empty:
-            st.info("暂无数据进行分析")
-        else:
-            # 活跃时间分析
-            st.subheader("⏰ 活跃时间分析")
-            if 'created_at' in df.columns:
-                df['record_hour'] = pd.to_datetime(df['created_at']).dt.hour
-
-                # 创建小时分布图
-                hour_counts = df['record_hour'].value_counts().sort_index()
-
-                # 使用matplotlib创建图表
-                fig_hour, ax_hour = plt.subplots(figsize=(10, 4))
-                ax_hour.bar(hour_counts.index, hour_counts.values, color='skyblue', edgecolor='black')
-                ax_hour.set_xlabel("小时 (24小时制)")
-                ax_hour.set_ylabel("记录数量")
-                ax_hour.set_title("记录时间分布")
-                ax_hour.set_xticks(range(0, 24, 2))
-                ax_hour.grid(True, alpha=0.3)
-                st.pyplot(fig_hour)
-
-            # 行为统计
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                if 'record_date' in df.columns:
-                    active_days = df['record_date'].nunique()
-                    st.metric("活跃天数", active_days)
-                else:
-                    st.metric("活跃天数", "--")
-
-            with col2:
-                if 'record_date' in df.columns and active_days > 0:
-                    avg_daily = len(df) / active_days
-                    st.metric("日均记录", f"{avg_daily:.1f}")
-                else:
-                    st.metric("日均记录", "--")
-
-            with col3:
-                if 'created_at' in df.columns and len(df) > 1:
-                    try:
-                        time_diffs = pd.to_datetime(df['created_at']).diff().dt.total_seconds() / 3600
-                        avg_interval = time_diffs.mean()
-                        st.metric("平均间隔", f"{avg_interval:.1f}小时")
-                    except:
-                        st.metric("平均间隔", "--")
-                else:
-                    st.metric("平均间隔", "--")
-
-            # 数据完整性检查
-            st.subheader("🔍 数据完整性检查")
-            data_hash = calculate_data_signature(df)
-
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                missing_sleep = df['sleep_hours'].isna().sum() if 'sleep_hours' in df.columns else 0
-                st.metric("缺失睡眠数据", missing_sleep)
-
-            with col2:
-                missing_stress = df['stress_level'].isna().sum() if 'stress_level' in df.columns else 0
-                st.metric("缺失压力数据", missing_stress)
-
-            with col3:
-                missing_activities = df['activities'].isna().sum() if 'activities' in df.columns else 0
-                st.metric("缺失活动数据", missing_activities)
-
-            # 数据签名
-            with st.expander("🔐 数据完整性验证"):
-                st.code(f"数据签名: {data_hash}")
-                if st.button("验证数据完整性"):
-                    # 重新计算哈希并验证
-                    current_hash = calculate_data_signature(df)
-                    if current_hash == data_hash:
-                        st.success("✅ 数据完整性验证通过")
-                    else:
-                        st.error("❌ 数据完整性验证失败，数据可能已被修改")
-
-            # 预测分析（简化版）
-            st.subheader("🔮 情绪预测")
-            if len(df) >= 10:
-                try:
-                    # 简单的线性回归预测
-                    X = np.arange(len(df)).reshape(-1, 1)
-                    y = df['mood_score'].values
-
-                    # 使用numpy进行简单线性回归
-                    x_mean = np.mean(X)
-                    y_mean = np.mean(y)
-
-                    numerator = np.sum((X - x_mean) * (y - y_mean))
-                    denominator = np.sum((X - x_mean) ** 2)
-
-                    if denominator != 0:
-                        slope = numerator / denominator
-                        intercept = y_mean - slope * x_mean
-
-                        # 预测未来3天
-                        future_X = np.arange(len(df), len(df) + 3).reshape(-1, 1)
-                        predictions = slope * future_X + intercept
-
-                        # 确保预测值在合理范围内
-                        predictions = np.clip(predictions, 1, 10)
-
-                        st.write("基于历史数据的趋势预测：")
-                        for i, pred in enumerate(predictions.flatten(), 1):
-                            st.write(f"未来第{i}天预测情绪: {pred:.1f}/10")
-
-                            # 给出简单建议
-                            if pred >= 8:
-                                st.info("预计情绪良好，继续保持！")
-                            elif pred <= 4:
-                                st.warning("预计情绪较低，建议提前做好心理准备")
-                    else:
-                        st.info("无法计算趋势，数据可能过于集中")
-
-                except Exception as e:
-                    st.error(f"预测分析出错: {e}")
-            else:
-                st.info("需要至少10条记录进行预测分析")
-
-            # 数据质量评分
-            st.subheader("📈 数据质量评分")
-            quality_score = 100
-
-            # 检查缺失数据
-            total_fields = len(df) * 3  # 主要字段数
-            missing_fields = 0
-
-            for field in ['sleep_hours', 'stress_level', 'activities']:
-                if field in df.columns:
-                    missing_fields += df[field].isna().sum()
-
-            if total_fields > 0:
-                completeness = 100 - (missing_fields / total_fields * 100)
-            else:
-                completeness = 0
-
-            # 检查记录频率
-            if 'created_at' in df.columns and len(df) > 1:
-                try:
-                    time_diffs = pd.to_datetime(df['created_at']).diff().dt.total_seconds() / 86400  # 转换为天
-                    avg_frequency = time_diffs.mean()
-
-                    if avg_frequency <= 2:  # 平均每2天记录一次
-                        frequency_score = 100
-                    elif avg_frequency <= 7:  # 平均每周记录一次
-                        frequency_score = 70
-                    else:
-                        frequency_score = 30
-                except:
-                    frequency_score = 50
-            else:
-                frequency_score = 50
-
-            # 计算综合评分
-            quality_score = (completeness + frequency_score) / 2
-
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                st.metric("数据完整性", f"{completeness:.0f}%")
-
-            with col2:
-                if 'created_at' in df.columns and len(df) > 1:
-                    try:
-                        time_diffs = pd.to_datetime(df['created_at']).diff().dt.total_seconds() / 86400
-                        avg_frequency = time_diffs.mean()
-                        st.metric("记录频率", f"{avg_frequency:.1f}天/次")
-                    except:
-                        st.metric("记录频率", "--")
-                else:
-                    st.metric("记录频率", "--")
-
-            with col3:
-                st.metric("数据质量", f"{quality_score:.0f}/100")
-
-                if quality_score >= 80:
-                    st.success("数据质量优秀！")
-                elif quality_score >= 60:
-                    st.info("数据质量良好")
-                elif quality_score >= 40:
-                    st.warning("数据质量一般")
-                else:
-                    st.error("数据质量有待提高")
-
-    # Tab 8: 安全中心（功能8）
-    with tab8:
         st.subheader("🔐 安全中心")
 
         col1, col2 = st.columns(2)
